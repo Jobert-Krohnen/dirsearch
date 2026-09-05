@@ -39,6 +39,10 @@ from lib.connection.native import NativeHTTPBackend
 from lib.connection.rate_limiter import RequestRateLimiter
 from lib.connection.requester import (
     AsyncRequester,
+    PathPreservingHTTPConnectionPool,
+    PathPreservingHTTPSConnectionPool,
+    PathPreservingSOCKSConnectionPool,
+    PathPreservingSOCKSHTTPSConnectionPool,
     Requester,
     _find_ssl_error,
     _format_ssl_error,
@@ -615,6 +619,32 @@ class TestRequesterBodyPreservation(BaseRequesterTestCase):
 
 
 class TestRequesterProxyRouting(BaseRequesterTestCase):
+    def test_proxy_managers_keep_path_preserving_connection_pools(self):
+        requester = Requester()
+        adapter = requester.session.get_adapter("http://")
+        try:
+            cases = (
+                (
+                    "http://proxy.invalid:8080",
+                    PathPreservingHTTPConnectionPool,
+                    PathPreservingHTTPSConnectionPool,
+                ),
+                (
+                    "socks5h://proxy.invalid:1080",
+                    PathPreservingSOCKSConnectionPool,
+                    PathPreservingSOCKSHTTPSConnectionPool,
+                ),
+            )
+            for proxy, http_pool, https_pool in cases:
+                with self.subTest(proxy=proxy):
+                    manager = adapter.proxy_manager_for(proxy)
+                    self.assertIs(manager.pool_classes_by_scheme["http"], http_pool)
+                    self.assertIs(
+                        manager.pool_classes_by_scheme["https"], https_pool
+                    )
+        finally:
+            requester.close()
+
     def test_proxy_scheme_never_bypasses_target_scheme(self):
         for proxy_scheme in ("http", "https"):
             proxy_url = f"{proxy_scheme}://proxy.invalid:8080"

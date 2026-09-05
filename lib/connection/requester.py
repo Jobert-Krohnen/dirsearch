@@ -30,11 +30,13 @@ from urllib.parse import urlparse
 
 import httpx
 import requests
+from httpx._transports.default import AsyncResponseStream, map_httpcore_exceptions
 from requests.auth import AuthBase, HTTPBasicAuth, HTTPDigestAuth
 from requests.packages import urllib3
 from urllib3 import connection as urllib3_connection
 from urllib3 import connectionpool as urllib3_connectionpool
 from urllib3 import poolmanager as urllib3_poolmanager
+from urllib3.contrib import socks as urllib3_socks
 from requests_ntlm import HttpNtlmAuth
 from httpx_ntlm import HttpNtlmAuth as HttpxNtlmAuth
 from requests_toolbelt.adapters.socket_options import SocketOptionsAdapter
@@ -83,11 +85,14 @@ def _join_request_target(base_url: str, quoted_path: str) -> str:
 # the already-quoted dirsearch target for direct requests so fuzzed characters
 # such as malformed percent escapes and backslashes reach the server unchanged.
 class _ScopedDNSConnection:
-    def __init__(self, *args, dns_resolver: DNSResolver, **kwargs):
+    def __init__(self, *args, dns_resolver: DNSResolver | None = None, **kwargs):
         self._dns_resolver = dns_resolver
         super().__init__(*args, **kwargs)
 
     def _new_conn(self):
+        if self._dns_resolver is None:
+            return super()._new_conn()
+
         original_host = self._dns_host
         self._dns_host = self._dns_resolver.resolve(original_host, self.port)
         try:
@@ -96,26 +101,43 @@ class _ScopedDNSConnection:
             self._dns_host = original_host
 
 
-class PathPreservingHTTPConnection(
-    _ScopedDNSConnection, urllib3_connection.HTTPConnection
-):
+class _PathPreservingRequestMixin:
     def request(self, method, url, body=None, headers=None, *args, **kwargs):
         target = getattr(_request_target_state, "target", None)
         if target:
             url = target
 
         return super().request(method, url, body, headers, *args, **kwargs)
+
+
+class PathPreservingHTTPConnection(
+    _PathPreservingRequestMixin,
+    _ScopedDNSConnection,
+    urllib3_connection.HTTPConnection,
+):
+    pass
 
 
 class PathPreservingHTTPSConnection(
-    _ScopedDNSConnection, urllib3_connection.HTTPSConnection
+    _PathPreservingRequestMixin,
+    _ScopedDNSConnection,
+    urllib3_connection.HTTPSConnection,
 ):
-    def request(self, method, url, body=None, headers=None, *args, **kwargs):
-        target = getattr(_request_target_state, "target", None)
-        if target:
-            url = target
+    pass
 
-        return super().request(method, url, body, headers, *args, **kwargs)
+
+class PathPreservingSOCKSConnection(
+    _PathPreservingRequestMixin,
+    urllib3_socks.SOCKSConnection,
+):
+    pass
+
+
+class PathPreservingSOCKSHTTPSConnection(
+    _PathPreservingRequestMixin,
+    urllib3_socks.SOCKSHTTPSConnection,
+):
+    pass
 
 
 class PathPreservingHTTPConnectionPool(urllib3_connectionpool.HTTPConnectionPool):
@@ -124,6 +146,16 @@ class PathPreservingHTTPConnectionPool(urllib3_connectionpool.HTTPConnectionPool
 
 class PathPreservingHTTPSConnectionPool(urllib3_connectionpool.HTTPSConnectionPool):
     ConnectionCls = PathPreservingHTTPSConnection
+
+
+class PathPreservingSOCKSConnectionPool(urllib3_socks.SOCKSHTTPConnectionPool):
+    ConnectionCls = PathPreservingSOCKSConnection
+
+
+class PathPreservingSOCKSHTTPSConnectionPool(
+    urllib3_socks.SOCKSHTTPSConnectionPool
+):
+    ConnectionCls = PathPreservingSOCKSHTTPSConnection
 
 
 class PathPreservingPoolManager(urllib3_poolmanager.PoolManager):
@@ -157,18 +189,37 @@ class PathPreservingSocketOptionsAdapter(SocketOptionsAdapter):
 
     def request_url(self, request: requests.PreparedRequest, proxies: dict[str, str]) -> str:
         target = getattr(request, "_dirsearch_request_target", None)
-        if target and not proxies:
+        if not target:
+            return super().request_url(request, proxies)
+
+        request_url = super().request_url(request, proxies)
+        if request_url.startswith("/"):
             return target
 
-        return super().request_url(request, proxies)
+        parsed_url = urlparse(request_url)
+        return f"{parsed_url.scheme}://{parsed_url.netloc}{target}"
+
+    def proxy_manager_for(self, proxy, **proxy_kwargs):
+        manager = super().proxy_manager_for(proxy, **proxy_kwargs)
+        if proxy.lower().startswith("socks"):
+            manager.pool_classes_by_scheme = {
+                "http": PathPreservingSOCKSConnectionPool,
+                "https": PathPreservingSOCKSHTTPSConnectionPool,
+            }
+        else:
+            manager.pool_classes_by_scheme = {
+                "http": PathPreservingHTTPConnectionPool,
+                "https": PathPreservingHTTPSConnectionPool,
+            }
+        return manager
 
     def send(self, request, **kwargs):
         target = getattr(request, "_dirsearch_request_target", None)
         proxies = kwargs.get("proxies") or {}
-        if not target or proxies:
+        if not target:
             return super().send(request, **kwargs)
 
-        _request_target_state.target = target
+        _request_target_state.target = self.request_url(request, proxies)
         try:
             return super().send(request, **kwargs)
         finally:
@@ -603,16 +654,51 @@ class ScopedDNSAsyncTransport(httpx.AsyncBaseTransport):
         await self._transport.aclose()
 
 
+class PathPreservingAsyncHTTPTransport(httpx.AsyncHTTPTransport):
+    """Pass a raw target into httpcore without leaking it into proxy subrequests."""
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        target = request.extensions.get("target")
+        if target is None:
+            return await super().handle_async_request(request)
+
+        import httpcore
+
+        # httpcore constructs its own absolute-form or CONNECT request. Leaving
+        # the override in extensions would replace those generated targets too.
+        extensions = dict(request.extensions)
+        extensions.pop("target")
+        core_request = httpcore.Request(
+            method=request.method,
+            url=httpcore.URL(
+                scheme=request.url.raw_scheme,
+                host=request.url.raw_host,
+                port=request.url.port,
+                target=target,
+            ),
+            headers=request.headers.raw,
+            content=request.stream,
+            extensions=extensions,
+        )
+        with map_httpcore_exceptions():
+            core_response = await self._pool.handle_async_request(core_request)
+
+        return httpx.Response(
+            status_code=core_response.status,
+            headers=core_response.headers,
+            stream=AsyncResponseStream(core_response.stream),
+            extensions=core_response.extensions,
+        )
+
+
 class ProxyRoatingTransport(httpx.AsyncBaseTransport):
     def __init__(self, proxies: list[str], **kwargs: Any) -> None:
         self._transports = [
-            httpx.AsyncHTTPTransport(proxy=proxy, **kwargs) for proxy in proxies
+            PathPreservingAsyncHTTPTransport(proxy=proxy, **kwargs)
+            for proxy in proxies
         ]
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        # Let httpcore choose absolute-form for forwarding and authority/origin-form
-        # for CONNECT tunnels. A custom target overrides all three request forms.
-        request.extensions.pop("target", None)
         transport = random.choice(self._transports)
         return await transport.handle_async_request(request)
 
@@ -692,7 +778,7 @@ class AsyncRequester(BaseRequester):
 
     async def replay_request(self, path: str, proxy: str) -> AsyncResponse:
         if self.replay_session is None:
-            transport = httpx.AsyncHTTPTransport(
+            transport = PathPreservingAsyncHTTPTransport(
                 verify=False,
                 cert=self._cert,
                 limits=httpx.Limits(max_connections=options["thread_count"]),
@@ -730,10 +816,8 @@ class AsyncRequester(BaseRequester):
                     headers=self.headers,
                     content=options["data"],
                     extensions={
-                        "target": (
-                            url
-                            if replay
-                            else _join_request_target(self._url, quoted_request_path)
+                        "target": _join_request_target(
+                            self._url, quoted_request_path
                         ).encode()
                     },
                 )
