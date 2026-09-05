@@ -28,7 +28,7 @@ class SQLiteReport(SQLReportMixin, BaseReport):
     _reuse = False
 
     def get_create_table_query(self, table):
-        return (f'''CREATE TABLE "{table}" (
+        return (f'''CREATE TABLE IF NOT EXISTS "{table}" (
             time DATETIME,
             url TEXT,
             status_code INTEGER,
