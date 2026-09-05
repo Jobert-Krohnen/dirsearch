@@ -126,7 +126,7 @@ class BaseScanner:
 
         # Compare 2 binary responses (Response.content is empty if the body is binary)
         if not self.response.content and not response.content:
-            return self.response.body == response.body
+            return self.response.has_same_body(response)
 
         return self.content_parser.compare_to(response.content)
 

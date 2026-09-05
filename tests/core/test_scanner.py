@@ -19,7 +19,7 @@
 from unittest import TestCase
 from unittest.mock import patch
 
-from lib.connection.response import NativeResponse
+from lib.connection.response import NativeResponse, Response
 from lib.core.data import options
 from lib.core.scanner import BaseScanner
 from lib.core.settings import REFLECTED_PATH_MARKER, WILDCARD_TEST_POINT_MARKER
@@ -42,6 +42,23 @@ class DynamicSoft404Requester:
             [("content-type", "text/html")],
             body,
         )
+
+
+class ChunkedResponse:
+    status_code = 200
+    history = []
+    encoding = None
+
+    def __init__(self, chunks):
+        self._chunks = chunks
+        self.headers = {
+            "content-type": "application/octet-stream",
+            "content-length": str(sum(map(len, chunks))),
+        }
+
+    def iter_content(self, chunk_size):
+        del chunk_size
+        yield from self._chunks
 
 
 class TestScanner(TestCase):
@@ -90,6 +107,37 @@ class TestScanner(TestCase):
         )
 
         self.assertTrue(scanner.check("admin", response))
+
+    def test_binary_prefix_match_does_not_hide_distinct_response(self):
+        prefix = b"\x00" + b"a" * 15
+        scanner = BaseScanner(None)
+        scanner.response = Response(
+            "https://example.com/wildcard.bin",
+            ChunkedResponse([prefix, b"LEFT"]),
+        )
+        response = Response(
+            "https://example.com/admin.bin",
+            ChunkedResponse([prefix, b"RGHT"]),
+        )
+
+        self.assertEqual(scanner.response.body, response.body)
+        self.assertEqual(scanner.classify("admin.bin", response), "unique")
+        self.assertEqual(scanner.reason, "response is unique enough")
+
+    def test_binary_fingerprint_still_matches_identical_responses(self):
+        prefix = b"\x00" + b"a" * 15
+        scanner = BaseScanner(None)
+        scanner.response = Response(
+            "https://example.com/wildcard.bin",
+            ChunkedResponse([prefix, b"SAME"]),
+        )
+        response = Response(
+            "https://example.com/admin.bin",
+            ChunkedResponse([prefix, b"SAME"]),
+        )
+
+        self.assertEqual(scanner.classify("admin.bin", response), "wildcard")
+        self.assertEqual(scanner.reason, "matches wildcard profile")
 
     def test_probable_wildcard_skips_expensive_similarity_for_large_bodies(self):
         class DummyParser:

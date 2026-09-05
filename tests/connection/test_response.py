@@ -121,6 +121,8 @@ class TestResponse(TestCase):
 
         self.assertEqual(default.body, chunks[0])
         self.assertEqual(captured.body, b"".join(chunks))
+        self.assertEqual(default, captured)
+        self.assertEqual(hash(default), hash(captured))
 
     def test_full_capture_never_exceeds_response_limit(self):
         with patch("lib.connection.response.MAX_RESPONSE_SIZE", 5):
@@ -131,6 +133,22 @@ class TestResponse(TestCase):
             )
 
         self.assertEqual(response.body, b"abcde")
+
+    def test_binary_responses_with_matching_prefixes_are_not_equal(self):
+        prefix = b"\x00" + b"a" * 15
+        headers = {"content-length": str(len(prefix) + 4)}
+        left = Response(
+            "http://example.com/left.bin",
+            DummyResponse(headers=headers, body=[prefix, b"LEFT"]),
+        )
+        right = Response(
+            "http://example.com/right.bin",
+            DummyResponse(headers=headers, body=[prefix, b"RGHT"]),
+        )
+
+        self.assertEqual(left.body, prefix)
+        self.assertEqual(right.body, prefix)
+        self.assertNotEqual(left, right)
 
 
 class TestAsyncResponse(IsolatedAsyncioTestCase):
@@ -195,6 +213,8 @@ class TestAsyncResponse(IsolatedAsyncioTestCase):
 
         self.assertEqual(default.body, chunks[0])
         self.assertEqual(captured.body, b"".join(chunks))
+        self.assertEqual(default, captured)
+        self.assertEqual(hash(default), hash(captured))
 
     async def test_full_capture_never_exceeds_response_limit(self):
         with patch("lib.connection.response.MAX_RESPONSE_SIZE", 5):
@@ -205,3 +225,19 @@ class TestAsyncResponse(IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(response.body, b"abcde")
+
+    async def test_binary_responses_with_matching_prefixes_are_not_equal(self):
+        prefix = b"\x00" + b"a" * 15
+        headers = {"content-length": str(len(prefix) + 4)}
+        left = await AsyncResponse.create(
+            "http://example.com/left.bin",
+            DummyAsyncResponse(headers=headers, body=[prefix, b"LEFT"]),
+        )
+        right = await AsyncResponse.create(
+            "http://example.com/right.bin",
+            DummyAsyncResponse(headers=headers, body=[prefix, b"RGHT"]),
+        )
+
+        self.assertEqual(left.body, prefix)
+        self.assertEqual(right.body, prefix)
+        self.assertNotEqual(left, right)
