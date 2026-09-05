@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import re
 import time
 import warnings
 from unittest import TestCase, skipUnless
@@ -26,6 +27,23 @@ PROXY_AUTHORIZATION = "Basic " + base64.b64encode(
 ).decode()
 PROXY_FAILURE_TIMEOUT = 0.2
 PROXY_CASE_DEADLINE = 2
+RAW_REQUEST_TARGET_CASES = (
+    ("malformed escape", "admin%3d..%1\\*", "/admin%3D..%1\\*"),
+    ("encoded backslash", "admin/%83%5c/..", "/admin/%83%5C/.."),
+    (
+        "query and unicode",
+        "admin?x=1 y=ñ&raw=%1\\*",
+        "/admin?x=1%20y=%C3%B1&raw=%1\\*",
+    ),
+)
+
+
+def normalize_percent_hex(target: str) -> str:
+    return re.sub(
+        r"%[0-9a-fA-F]{2}",
+        lambda match: match.group(0).upper(),
+        target,
+    )
 
 
 class TestProxyIntegration(TestCase):
@@ -87,6 +105,58 @@ class TestProxyIntegration(TestCase):
 
                 self.assertIsNone(error)
                 self._assert_case(proxy, target, path, response)
+
+    def test_sync_engine_preserves_raw_targets_through_proxies(self):
+        for name, path, expected in RAW_REQUEST_TARGET_CASES:
+            for proxy, target in self._cases():
+                with self.subTest(
+                    case=name,
+                    proxy=proxy.scheme,
+                    target=target.scheme,
+                ):
+                    self._prepare_case(proxy, target)
+                    response, error, _ = self._sync_request(proxy, target, path)
+
+                    self.assertIsNone(error)
+                    self._assert_raw_target(target, expected, response)
+
+    def test_async_engine_preserves_raw_targets_through_proxies(self):
+        asyncio.run(self._test_async_engine_raw_targets())
+
+    async def _test_async_engine_raw_targets(self):
+        for name, path, expected in RAW_REQUEST_TARGET_CASES:
+            for proxy, target in self._cases():
+                with self.subTest(
+                    case=name,
+                    proxy=proxy.scheme,
+                    target=target.scheme,
+                ):
+                    self._prepare_case(proxy, target)
+                    response, error, _ = await self._async_request(
+                        proxy, target, path
+                    )
+
+                    self.assertIsNone(error)
+                    self._assert_raw_target(target, expected, response)
+
+    def test_async_replay_preserves_raw_targets_through_proxies(self):
+        asyncio.run(self._test_async_replay_raw_targets())
+
+    async def _test_async_replay_raw_targets(self):
+        for name, path, expected in RAW_REQUEST_TARGET_CASES:
+            for proxy, target in self._cases():
+                with self.subTest(
+                    case=name,
+                    proxy=proxy.scheme,
+                    target=target.scheme,
+                ):
+                    self._prepare_case(proxy, target)
+                    response, error = await self._async_replay_request(
+                        proxy, target, path
+                    )
+
+                    self.assertIsNone(error)
+                    self._assert_raw_target(target, expected, response)
 
     @skipUnless(
         dirsearch_native is not None
@@ -355,6 +425,19 @@ class TestProxyIntegration(TestCase):
             await requester.session.aclose()
 
     @staticmethod
+    async def _async_replay_request(proxy, target, path):
+        options["proxies"] = []
+        requester = AsyncRequester()
+        requester.set_url(target.url)
+        try:
+            try:
+                return await requester.replay_request(path, proxy.url), None
+            except RequestException as error:
+                return None, error
+        finally:
+            await requester.close()
+
+    @staticmethod
     def _native_request(proxy, target, path):
         options["proxies"] = [proxy.url]
         backend = NativeHTTPBackend()
@@ -375,6 +458,14 @@ class TestProxyIntegration(TestCase):
         self.assertEqual(target.proxy_authorizations, [None])
 
         self.assertEqual(proxy.events, [self._expected_proxy_event(target, path)])
+
+    def _assert_raw_target(self, target, expected, response):
+        self.assertIsNotNone(response)
+        self.assertEqual(response.status, 200)
+        self.assertEqual(
+            [normalize_percent_hex(path) for _, path in target.events],
+            [expected],
+        )
 
     def _assert_authentication_rejected(
         self,
