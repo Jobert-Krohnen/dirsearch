@@ -18,9 +18,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import time
 from typing import Any
 
-import time
 import httpx
 import requests
 
@@ -32,6 +33,71 @@ from lib.core.settings import (
 )
 from lib.parse.url import clean_path, parse_path
 from lib.utils.common import get_readable_size, is_binary, replace_path
+
+
+def _decoded_content_length(headers) -> int | None:
+    if headers.get("transfer-encoding"):
+        return None
+
+    content_encoding = headers.get("content-encoding", "").strip().lower()
+    if content_encoding and content_encoding != "identity":
+        return None
+
+    try:
+        length = int(headers.get("content-length"))
+    except (TypeError, ValueError):
+        return None
+
+    return length if length >= 0 else None
+
+
+class _BodyCapture:
+    """Keep response bodies bounded while retaining a complete binary digest."""
+
+    def __init__(self, headers, capture_full_body: bool) -> None:
+        self.body = bytearray()
+        self.complete = False
+        self.digest = None
+        self._capture_full_body = capture_full_body
+        self._headers = headers
+        self._read_length = 0
+
+    def add(self, chunk: bytes) -> bool:
+        remaining = MAX_RESPONSE_SIZE - self._read_length
+        captured = chunk[:remaining]
+        self._read_length += len(captured)
+
+        if self.digest is not None:
+            self.digest.update(captured)
+        else:
+            self.body.extend(captured)
+            if (
+                not self._capture_full_body
+                and self._headers.get("content-length") is not None
+                and is_binary(self.body)
+            ):
+                # Keep only the captured binary prefix, but digest later chunks
+                # so wildcard checks never treat that prefix as the whole body.
+                self.digest = hashlib.sha256(self.body)
+
+        if len(captured) < len(chunk) or self._read_length >= MAX_RESPONSE_SIZE:
+            self.complete = (
+                len(captured) == len(chunk)
+                and _decoded_content_length(self._headers) == self._read_length
+            )
+            return False
+
+        return True
+
+    def finish(self) -> None:
+        self.complete = True
+
+    @property
+    def body_digest(self) -> bytes | None:
+        if self.digest is None:
+            return None
+
+        return self.digest.digest()
 
 
 class BaseResponse:
@@ -47,6 +113,8 @@ class BaseResponse:
         self.elapsed = elapsed
         self.content = ""
         self.body = b""
+        self._body_complete = True
+        self._body_digest = None
 
     @property
     def type(self) -> str:
@@ -93,14 +161,43 @@ class BaseResponse:
     def __hash__(self) -> int:
         # Hash the static parts of the response only.
         # See https://github.com/maurosoria/dirsearch/pull/1436#issuecomment-2476390956
-        body = replace_path(self.content, self.full_path.split("#")[0], "") if self.content else self.body
+        body = (
+            replace_path(self.content, self.full_path.split("#")[0], "")
+            if self.content
+            else self._body_fingerprint
+        )
         return hash((self.status, body))
 
+    @property
+    def _body_fingerprint(self) -> bytes:
+        if self._body_digest is not None:
+            return self._body_digest
+
+        return hashlib.sha256(self.body).digest()
+
+    def has_same_body(self, other: BaseResponse) -> bool:
+        """Return whether both responses contain the same complete body."""
+        if self is other:
+            return True
+
+        return (
+            self._body_complete
+            and other._body_complete
+            and (
+                self.body == other.body
+                if self._body_digest is None and other._body_digest is None
+                else self._body_fingerprint == other._body_fingerprint
+            )
+        )
+
     def __eq__(self, other: Any) -> bool:
-        return (self.status, self.body, self.redirect) == (
-            other.status,
-            other.body,
-            other.redirect,
+        if not isinstance(other, BaseResponse):
+            return NotImplemented
+
+        return (
+            self.status == other.status
+            and self.redirect == other.redirect
+            and self.has_same_body(other)
         )
 
 
@@ -113,20 +210,17 @@ class Response(BaseResponse):
         capture_full_body: bool = False,
     ) -> None:
         super().__init__(url, response, elapsed)
-        body = bytearray()
+        capture = _BodyCapture(self.headers, capture_full_body)
 
         for chunk in response.iter_content(chunk_size=ITER_CHUNK_SIZE):
-            remaining = MAX_RESPONSE_SIZE - len(body)
-            body.extend(chunk[:remaining])
-
-            if len(body) >= MAX_RESPONSE_SIZE or (
-                not capture_full_body
-                and "content-length" in self.headers
-                and is_binary(body)
-            ):
+            if not capture.add(chunk):
                 break
+        else:
+            capture.finish()
 
-        self.body = bytes(body)
+        self.body = bytes(capture.body)
+        self._body_complete = capture.complete
+        self._body_digest = capture.body_digest
         if not is_binary(self.body):
             try:
                 self.content = self.body.decode(
@@ -146,19 +240,16 @@ class AsyncResponse(BaseResponse):
         capture_full_body: bool = False,
     ) -> AsyncResponse:
         self = cls(url, response, elapsed)
-        body = bytearray()
+        capture = _BodyCapture(self.headers, capture_full_body)
         async for chunk in response.aiter_bytes(chunk_size=ITER_CHUNK_SIZE):
-            remaining = MAX_RESPONSE_SIZE - len(body)
-            body.extend(chunk[:remaining])
-
-            if len(body) >= MAX_RESPONSE_SIZE or (
-                not capture_full_body
-                and "content-length" in self.headers
-                and is_binary(body)
-            ):
+            if not capture.add(chunk):
                 break
+        else:
+            capture.finish()
 
-        self.body = bytes(body)
+        self.body = bytes(capture.body)
+        self._body_complete = capture.complete
+        self._body_digest = capture.body_digest
         if not is_binary(self.body):
             try:
                 self.content = self.body.decode(
@@ -198,6 +289,8 @@ class NativeResponse(BaseResponse):
         self.filtered = filtered
         self.filter_reason = filter_reason
         self.body = bytes(body)
+        if self._length is not None:
+            self._body_complete = self._length == len(self.body)
         if not is_binary(self.body):
             self.content = self.body.decode(DEFAULT_ENCODING, errors="replace")
 

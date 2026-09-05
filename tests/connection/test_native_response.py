@@ -96,3 +96,22 @@ class TestNativeResponse(TestCase):
         self.assertEqual(response.filter_reason, "advanced_filter")
         self.assertEqual(response.body, b"")
         self.assertEqual(response.length, 123)
+
+    def test_truncated_native_responses_do_not_compare_as_complete_bodies(self):
+        prefix = b"\x00" + b"a" * 15
+        left = NativeResponse(
+            "https://example.com/left.bin",
+            200,
+            [("Content-Length", str(len(prefix) + 4))],
+            prefix,
+            length=len(prefix) + 4,
+        )
+        right = NativeResponse(
+            "https://example.com/right.bin",
+            200,
+            [("Content-Length", str(len(prefix) + 4))],
+            prefix,
+            length=len(prefix) + 4,
+        )
+
+        self.assertNotEqual(left, right)
