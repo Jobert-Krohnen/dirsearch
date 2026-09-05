@@ -101,11 +101,8 @@ class SQLReportMixin:
 
         return self._conn
 
-    def get_drop_table_query(self, table):
-        return (f'''DROP TABLE IF EXISTS "{table}";''',)
-
     def get_create_table_query(self, table):
-        return (f'''CREATE TABLE "{table}" (
+        return (f'''CREATE TABLE IF NOT EXISTS "{table}" (
             time TIMESTAMP,
             url TEXT,
             status_code INTEGER,
@@ -127,7 +124,6 @@ class SQLReportMixin:
 
         cursor = conn.cursor()
 
-        cursor.execute(*self.get_drop_table_query(table))
         cursor.execute(*self.get_create_table_query(table))
         conn.commit()
 
