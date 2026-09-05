@@ -29,24 +29,25 @@ from lib.report.simple_report import SimpleReport
 from lib.report.sqlite_report import SQLiteReport
 from lib.report.xml_report import XMLReport
 
+# Store option keys so restored session destinations are resolved at manager creation.
 output_handlers = {
-    "simple": (SimpleReport, [options["output_file"]]),
-    "plain": (PlainTextReport, [options["output_file"]]),
-    "json": (JSONReport, [options["output_file"]]),
-    "xml": (XMLReport, [options["output_file"]]),
-    "md": (MarkdownReport, [options["output_file"]]),
-    "csv": (CSVReport, [options["output_file"]]),
-    "html": (HTMLReport, [options["output_file"]]),
-    "sqlite": (SQLiteReport, [options["output_file"], options["output_table"]]),
+    "simple": (SimpleReport, ("output_file",)),
+    "plain": (PlainTextReport, ("output_file",)),
+    "json": (JSONReport, ("output_file",)),
+    "xml": (XMLReport, ("output_file",)),
+    "md": (MarkdownReport, ("output_file",)),
+    "csv": (CSVReport, ("output_file",)),
+    "html": (HTMLReport, ("output_file",)),
+    "sqlite": (SQLiteReport, ("output_file", "output_table")),
     "mysql": (
         "lib.report.mysql_report",
         "MySQLReport",
-        [options["mysql_url"], options["output_table"]],
+        ("mysql_url", "output_table"),
     ),
     "postgresql": (
         "lib.report.postgresql_report",
         "PostgreSQLReport",
-        [options["postgres_url"], options["output_table"]],
+        ("postgres_url", "output_table"),
     ),
 }
 
@@ -58,7 +59,7 @@ class ReportManager:
         for format in formats:
             # No output location provided
             handler = output_handlers[format]
-            sources = handler[-1]
+            sources = [options[key] for key in handler[-1]]
             if any(not _ for _ in sources):
                 continue
             self.reports.append((self._load_report(handler)(), sources))
